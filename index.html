@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>PDF → Email Extractor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- PDF.js library (from CDN) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"
+          integrity="sha512-Z2VZlJpS+1B5bppdLoRy1y+aiqplPBeoeOS+lon/+tng+9AhpRKADSdqCEsSFqjrfWXrFf9xmvfZrA0e8QjjKg=="
+          crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 1rem auto;
+      max-width: 800px;
+    }
+    h1 {
+      text-align: center;
+    }
+    .upload-container {
+      text-align: center;
+      margin-bottom: 1.5rem;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 1rem;
+    }
+    th, td {
+      border: 1px solid #ccc;
+      padding: 0.5rem;
+      text-align: left;
+    }
+    th {
+      background-color: #f4f4f4;
+    }
+    .hidden {
+      display: none;
+    }
+    #downloadCsvBtn {
+      margin-top: 1rem;
+    }
+    #errorMsg {
+      color: red;
+      margin-top: 1rem;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <h1>📄 PDF → Email Extractor</h1>
+
+  <div class="upload-container">
+    <input type="file" id="pdfFileInput" accept=".pdf" />
+    <button id="processBtn" disabled>Process PDF</button>
+    <div id="errorMsg" class="hidden"></div>
+  </div>
+
+  <div id="resultsSection" class="hidden">
+    <button id="downloadCsvBtn">Download CSV</button>
+    <div id="tableContainer"></div>
+  </div>
+
+  <script>
+    // 1) Grab DOM elements
+    const pdfFileInput = document.getElementById('pdfFileInput');
+    const processBtn = document.getElementById('processBtn');
+    const errorMsg = document.getElementById('errorMsg');
+    const resultsSection = document.getElementById('resultsSection');
+    const tableContainer = document.getElementById('tableContainer');
+    const downloadCsvBtn = document.getElementById('downloadCsvBtn');
+
+    let extractedRecords = []; // Will hold { first, last, email }
+
+    // 2) Enable "Process PDF" only after a PDF is chosen
+    pdfFileInput.addEventListener('change', () => {
+      errorMsg.classList.add('hidden');
+      tableContainer.innerHTML = '';
+      resultsSection.classList.add('hidden');
+      extractedRecords = [];
+      if (pdfFileInput.files.length && pdfFileInput.files[0].type === 'application/pdf') {
+        processBtn.disabled = false;
+      } else {
+        processBtn.disabled = true;
+      }
+    });
+
+    // 3) Main flow: when user clicks "Process PDF"
+    processBtn.addEventListener('click', () => {
+      errorMsg.classList.add('hidden');
+      tableContainer.innerHTML = '';
+      resultsSection.classList.add('hidden');
+      extractedRecords = [];
+
+      const file = pdfFileInput.files[0];
+      if (!file || file.type !== 'application/pdf') {
+        showError('Please upload a valid PDF file.');
+        return;
+      }
+      processBtn.disabled = true;
+      readPdfAndExtract(file)
+        .then(records => {
+          processBtn.disabled = false;
+          if (records.length === 0) {
+            showError('No email addresses detected.');
+            return;
+          }
+          extractedRecords = records;
+          renderTable(records);
+          resultsSection.classList.remove('hidden');
+        })
+        .catch(err => {
+          console.error(err);
+          processBtn.disabled = false;
+          showError('Error processing PDF. Make sure it is not password‑protected or corrupted.');
+        });
+    });
+
+    // 4) Show error in the UI
+    function showError(msg) {
+      errorMsg.textContent = msg;
+      errorMsg.classList.remove('hidden');
+    }
+
+    // 5) Use PDF.js to read the PDF, extract all text lines, then parse names & emails
+    async function readPdfAndExtract(file) {
+      // Load PDF.js
+      const arrayBuffer = await file.arrayBuffer();
+      const uint8Array = new Uint8Array(arrayBuffer);
+      const loadingTask = pdfjsLib.getDocument({ data: uint8Array });
+      const pdf = await loadingTask.promise;
+
+      let allLines = [];
+      for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+        const page = await pdf.getPage(pageNum);
+        const textContent = await page.getTextContent();
+        // textContent.items is an array of text items, each with a string and positions
+        // We'll concatenate them by y coordinate to reconstruct lines roughly in order.
+        const linesOnPage = groupTextItemsIntoLines(textContent.items);
+        allLines.push(...linesOnPage);
+      }
+
+      return extractNamesAndEmails(allLines);
+    }
+
+    // 6) Group PDF.js textItems into lines by y‑coordinate (roughly)
+    function groupTextItemsIntoLines(textItems) {
+      // Each textItem has: str (the text), transform (position info)
+      // transform[5] is the y coordinate
+      const tolerance = 2; // pixels; adjust if PDF text positions are weird
+      const lines = [];
+
+      textItems.forEach(item => {
+        const y = Math.round(item.transform[5]);
+        item._y = y;
+      });
+
+      // Sort by y descending (top of page) then x ascending
+      textItems.sort((a, b) => {
+        if (b._y !== a._y) return b._y - a._y;
+        return a.transform[4] - b.transform[4];
+      });
+
+      textItems.forEach(item => {
+        const y = item._y;
+        // Try to find an existing line with nearly same y
+        let lineObj = lines.find(l => Math.abs(l.y - y) <= tolerance);
+        if (!lineObj) {
+          lineObj = { y: y, text: item.str };
+          lines.push(lineObj);
+        } else {
+          lineObj.text += ' ' + item.str;
+        }
+      });
+
+      // Now sort lines by y descending (so the first line in array is top of page)
+      lines.sort((a, b) => b.y - a.y);
+
+      // Return just the text strings in reading order
+      return lines.map(l => l.text.trim());
+    }
+
+    // 7) Given an array of text lines (in top→bottom order), find name above each email
+    function extractNamesAndEmails(lines) {
+      const emailRegex = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+      const records = [];
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const matches = [...line.matchAll(emailRegex)];
+        if (matches.length) {
+          // For each email found in this line, attempt to grab the line above as the "full name"
+          matches.forEach(match => {
+            const email = match[0].toLowerCase();
+            // Look upward for a non‑empty line that (we assume) is the name
+            let nameLine = '';
+            if (i > 0 && lines[i - 1].trim() !== '') {
+              nameLine = lines[i - 1].trim();
+            }
+            // Split nameLine into tokens
+            const tokens = nameLine.split(/\s+/);
+            let firstName = '';
+            let lastName = '';
+            if (tokens.length >= 2) {
+              firstName = tokens[0];
+              lastName = tokens[tokens.length - 1];
+            }
+            // If nameLine is blank or only one token, leave names blank
+            records.push({ first: firstName, last: lastName, email: email });
+          });
+        }
+      }
+
+      // Optional: Deduplicate by email (keep first occurrence)
+      const seen = new Set();
+      const deduped = [];
+      records.forEach(r => {
+        if (!seen.has(r.email)) {
+          seen.add(r.email);
+          deduped.push(r);
+        }
+      });
+      return deduped;
+    }
+
+    // 8) Render an HTML table of results
+    function renderTable(records) {
+      const table = document.createElement('table');
+      const headerRow = document.createElement('tr');
+      ['First Name', 'Last Name', 'Email'].forEach(text => {
+        const th = document.createElement('th');
+        th.textContent = text;
+        headerRow.appendChild(th);
+      });
+      table.appendChild(headerRow);
+
+      records.forEach(r => {
+        const row = document.createElement('tr');
+        [r.first, r.last, r.email].forEach(val => {
+          const td = document.createElement('td');
+          td.textContent = val;
+          row.appendChild(td);
+        });
+        table.appendChild(row);
+      });
+
+      tableContainer.innerHTML = ''; // clear any previous
+      tableContainer.appendChild(table);
+    }
+
+    // 9) Build CSV and trigger download when button is clicked
+    downloadCsvBtn.addEventListener('click', () => {
+      if (!extractedRecords.length) return;
+      const header = ['First Name', 'Last Name', 'Email'];
+      const rows = extractedRecords.map(r => [r.first, r.last, r.email]);
+
+      // Convert to CSV string
+      let csvContent = header.join(',') + '\n';
+      rows.forEach(cols => {
+        // Escape any double quotes
+        const line = cols.map(field => `"${field.replace(/"/g, '""')}"`).join(',');
+        csvContent += line + '\n';
+      });
+
+      // Create blob & download link
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'extracted_emails.csv';
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+  </script>
+</body>
+</html>
