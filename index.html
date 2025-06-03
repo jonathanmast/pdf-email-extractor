@@ -5,10 +5,10 @@
   <title>PDF → Email Extractor</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
-<!-- Load PDF.js from unpkg instead -->
-<script src="https://unpkg.com/pdfjs-dist@2.16.105/build/pdf.min.js"></script>
+  <!-- Load PDF.js from unpkg -->
+  <script src="https://unpkg.com/pdfjs-dist@2.16.105/build/pdf.min.js"></script>
   <!-- Tesseract.js (for OCR) -->
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@2.1.5/dist/tesseract.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@2.1.5/dist/tesseract.min.js"></script>
 
   <style>
     body {
@@ -124,7 +124,7 @@
       errorMsg.classList.remove('hidden');
     }
 
-    // 5) Use PDF.js to read the PDF, extract all text lines, then parse names & emails
+    // 5) Use PDF.js to render each page to canvas, then OCR via Tesseract.js
     async function readPdfAndExtract(file) {
       // Load PDF.js
       const arrayBuffer = await file.arrayBuffer();
@@ -132,57 +132,39 @@
       const loadingTask = pdfjsLib.getDocument({ data: uint8Array });
       const pdf = await loadingTask.promise;
 
+      // Create a hidden canvas element for rendering pages
+      const hiddenCanvas = document.createElement('canvas');
+      const ctx = hiddenCanvas.getContext('2d');
+
       let allLines = [];
+
+      // Process each page
       for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
         const page = await pdf.getPage(pageNum);
-        const textContent = await page.getTextContent();
-        // textContent.items is an array of text items, each with a string and positions
-        // We'll concatenate them by y coordinate to reconstruct lines roughly in order.
-        const linesOnPage = groupTextItemsIntoLines(textContent.items);
-        allLines.push(...linesOnPage);
+        const viewport = page.getViewport({ scale: 2.0 }); // Higher scale yields better OCR accuracy
+        hiddenCanvas.width = viewport.width;
+        hiddenCanvas.height = viewport.height;
+
+        // Render the page into the hidden canvas
+        await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+
+        // Perform OCR on the canvas
+        const { data: { text } } = await Tesseract.recognize(
+          hiddenCanvas,
+          'eng',
+          { logger: m => console.log(`OCR page ${pageNum}:`, m) }
+        );
+
+        // Split the OCR text into lines, filter out empty lines
+        const pageLines = text.split('\n').map(l => l.trim()).filter(l => l !== '');
+        allLines.push(...pageLines);
       }
 
+      // Apply name+email extraction logic on the full list of lines
       return extractNamesAndEmails(allLines);
     }
 
-    // 6) Group PDF.js textItems into lines by y‑coordinate (roughly)
-    function groupTextItemsIntoLines(textItems) {
-      // Each textItem has: str (the text), transform (position info)
-      // transform[5] is the y coordinate
-      const tolerance = 2; // pixels; adjust if PDF text positions are weird
-      const lines = [];
-
-      textItems.forEach(item => {
-        const y = Math.round(item.transform[5]);
-        item._y = y;
-      });
-
-      // Sort by y descending (top of page) then x ascending
-      textItems.sort((a, b) => {
-        if (b._y !== a._y) return b._y - a._y;
-        return a.transform[4] - b.transform[4];
-      });
-
-      textItems.forEach(item => {
-        const y = item._y;
-        // Try to find an existing line with nearly same y
-        let lineObj = lines.find(l => Math.abs(l.y - y) <= tolerance);
-        if (!lineObj) {
-          lineObj = { y: y, text: item.str };
-          lines.push(lineObj);
-        } else {
-          lineObj.text += ' ' + item.str;
-        }
-      });
-
-      // Now sort lines by y descending (so the first line in array is top of page)
-      lines.sort((a, b) => b.y - a.y);
-
-      // Return just the text strings in reading order
-      return lines.map(l => l.text.trim());
-    }
-
-    // 7) Given an array of text lines (in top→bottom order), find name above each email
+    // 6) Given an array of OCR lines, find name above each email
     function extractNamesAndEmails(lines) {
       const emailRegex = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
       const records = [];
@@ -191,14 +173,20 @@
         const line = lines[i];
         const matches = [...line.matchAll(emailRegex)];
         if (matches.length) {
-          // For each email found in this line, attempt to grab the line above as the "full name"
           matches.forEach(match => {
             const email = match[0].toLowerCase();
-            // Look upward for a non‑empty line that (we assume) is the name
+
+            // Heuristic: look upward for a candidate name line
             let nameLine = '';
-            if (i > 0 && lines[i - 1].trim() !== '') {
-              nameLine = lines[i - 1].trim();
+            // Skip intervening lines like "Requested 4 minutes ago" if present
+            let j = i - 1;
+            while (j >= 0 && lines[j].toLowerCase().includes('requested')) {
+              j--;
             }
+            if (j >= 0) {
+              nameLine = lines[j].trim();
+            }
+
             // Split nameLine into tokens
             const tokens = nameLine.split(/\s+/);
             let firstName = '';
@@ -207,13 +195,13 @@
               firstName = tokens[0];
               lastName = tokens[tokens.length - 1];
             }
-            // If nameLine is blank or only one token, leave names blank
-            records.push({ first: firstName, last: lastName, email: email });
+
+            records.push({ first: firstName, last: lastName, email });
           });
         }
       }
 
-      // Optional: Deduplicate by email (keep first occurrence)
+      // Deduplicate by email (keep first occurrence)
       const seen = new Set();
       const deduped = [];
       records.forEach(r => {
@@ -225,7 +213,7 @@
       return deduped;
     }
 
-    // 8) Render an HTML table of results
+    // 7) Render an HTML table of results
     function renderTable(records) {
       const table = document.createElement('table');
       const headerRow = document.createElement('tr');
@@ -250,7 +238,7 @@
       tableContainer.appendChild(table);
     }
 
-    // 9) Build CSV and trigger download when button is clicked
+    // 8) Build CSV and trigger download when button is clicked
     downloadCsvBtn.addEventListener('click', () => {
       if (!extractedRecords.length) return;
       const header = ['First Name', 'Last Name', 'Email'];
@@ -259,7 +247,6 @@
       // Convert to CSV string
       let csvContent = header.join(',') + '\n';
       rows.forEach(cols => {
-        // Escape any double quotes
         const line = cols.map(field => `"${field.replace(/"/g, '""')}"`).join(',');
         csvContent += line + '\n';
       });
